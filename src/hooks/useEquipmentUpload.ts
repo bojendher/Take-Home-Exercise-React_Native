@@ -1,8 +1,9 @@
-import type { ImagePickerAsset } from "expo-image-picker";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { UploadError } from "@/lib/api/errors";
 import type { RetryInfo } from "@/lib/api/http";
+import { newId } from "@/lib/id";
+import type { StoredImage, UploadResume } from "@/lib/storage/types";
 import { uploadEquipment, type UploadSession } from "@/lib/uploadEquipment";
 
 export type ImageUploadStatus = "pending" | "uploading" | "done" | "failed";
@@ -20,32 +21,54 @@ type State = {
 
 const IDLE: State = { phase: "idle", statuses: [], current: null, retry: null, error: null };
 
-type Resume = { fingerprint: string; uploadId?: string; idempotencyKey: string };
-
-const newKey = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-
 /** Identifies "the same submission", so changing photos or fields starts fresh. */
-function fingerprintOf(images: ImagePickerAsset[], brand: string, model: string) {
-  return JSON.stringify([brand, model, images.map((i) => i.assetId ?? i.uri)]);
+export function fingerprintOf(images: StoredImage[], brand: string, model: string) {
+  return JSON.stringify([brand.trim(), model.trim(), images.map((i) => i.id)]);
 }
 
-export function useEquipmentUpload() {
+/** Resume info for this submission: the persisted one if it matches, else new. */
+function resumeFor(current: UploadResume | null, fingerprint: string): UploadResume {
+  return current?.fingerprint === fingerprint
+    ? current
+    : { fingerprint, idempotencyKey: newId(), sentIds: [], queued: false };
+}
+
+type Options = {
+  /** Persisted resume info (from the draft). */
+  resume: UploadResume | null;
+  onResumeChange: (resume: UploadResume | null) => void;
+};
+
+export function useEquipmentUpload({ resume, onResumeChange }: Options) {
   const [state, setState] = useState<State>(IDLE);
   const abortRef = useRef<AbortController | null>(null);
-  const resumeRef = useRef<Resume | null>(null);
+  const resumeRef = useRef(resume);
+  const onResumeChangeRef = useRef(onResumeChange);
+  useEffect(() => {
+    resumeRef.current = resume;
+    onResumeChangeRef.current = onResumeChange;
+  }, [resume, onResumeChange]);
 
   // Cancel any in-flight upload on unmount.
   useEffect(() => () => abortRef.current?.abort(), []);
 
+  /** Offline: remember the submission; it starts automatically when back online. */
+  const queue = useCallback((images: StoredImage[], brand: string, model: string) => {
+    const r = resumeFor(resumeRef.current, fingerprintOf(images, brand, model));
+    onResumeChangeRef.current({ ...r, queued: true });
+    setState(IDLE);
+  }, []);
+
   const start = useCallback(
-    async (images: ImagePickerAsset[], brand: string, model: string): Promise<UploadSession | null> => {
+    async (images: StoredImage[], brand: string, model: string): Promise<UploadSession | null> => {
       if (abortRef.current) return null; // already uploading: ignore double taps
 
-      const fingerprint = fingerprintOf(images, brand, model);
-      if (resumeRef.current?.fingerprint !== fingerprint) {
-        resumeRef.current = { fingerprint, idempotencyKey: newKey() };
-      }
-      const resume = resumeRef.current;
+      let resume: UploadResume = { ...resumeFor(resumeRef.current, fingerprintOf(images, brand, model)), queued: false };
+      const save = (next: UploadResume | null) => {
+        if (next) resume = next;
+        onResumeChangeRef.current(next);
+      };
+      save(resume);
 
       const ctrl = new AbortController();
       abortRef.current = ctrl;
@@ -60,15 +83,22 @@ export function useEquipmentUpload() {
       try {
         const session = await uploadEquipment({
           images,
-          brand,
-          model,
+          brand: brand.trim(),
+          model: model.trim(),
           resumeUploadId: resume.uploadId,
           idempotencyKey: resume.idempotencyKey,
           signal: ctrl.signal,
           onEvent: (event) => {
             if (event.type === "session") {
-              resume.uploadId = event.uploadId;
+              // A new session means previously "sent" ids no longer apply.
+              if (event.uploadId !== resume.uploadId) {
+                save({ ...resume, uploadId: event.uploadId, sentIds: [] });
+              }
               return;
+            }
+            if (event.type === "image" && event.status === "done") {
+              const id = images[event.index].id;
+              if (!resume.sentIds.includes(id)) save({ ...resume, sentIds: [...resume.sentIds, id] });
             }
             setState((s) => {
               if (event.type === "retry") return { ...s, retry: event };
@@ -83,13 +113,16 @@ export function useEquipmentUpload() {
             });
           },
         });
-        resumeRef.current = null;
+        save(null);
         setState((s) => ({ ...s, phase: "success", current: null, retry: null }));
         return session;
       } catch (error) {
         if (error instanceof UploadError && error.kind === "rejected") {
           // The server refused this submission; don't resume a session it rejected.
-          resumeRef.current = null;
+          save(null);
+        } else if (error instanceof UploadError && error.kind === "offline") {
+          // Lost connectivity for too long: continue automatically when back online.
+          save({ ...resume, queued: true });
         }
         setState((s) => ({ ...s, phase: "error", current: null, retry: null, error }));
         return null;
@@ -109,9 +142,8 @@ export function useEquipmentUpload() {
 
   const reset = useCallback(() => {
     abortRef.current?.abort();
-    resumeRef.current = null;
     setState(IDLE);
   }, []);
 
-  return { ...state, start, cancel, dismiss, reset };
+  return { ...state, start, queue, cancel, dismiss, reset };
 }

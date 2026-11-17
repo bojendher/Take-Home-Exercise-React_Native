@@ -1,7 +1,7 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
 import * as ImagePicker from "expo-image-picker";
 import { useNetworkState } from "expo-network";
-import { useState, type ComponentProps } from "react";
+import { useEffect, useRef, type ComponentProps } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -17,7 +17,9 @@ import {
 } from "react-native";
 
 import { colors, spacing } from "@/constants/theme";
+import { useEquipmentDraft } from "@/hooks/useEquipmentDraft";
 import {
+  fingerprintOf,
   useEquipmentUpload,
   type ImageUploadStatus,
 } from "@/hooks/useEquipmentUpload";
@@ -41,32 +43,68 @@ const LIBRARY_OPTIONS: ImagePicker.ImagePickerOptions = {
 const DANGER = "#DC2626";
 const SUCCESS = "#16A34A";
 
-// Prefer the stable library id; camera captures only have a uri.
-const assetKey = (a: ImagePicker.ImagePickerAsset) => a.assetId ?? a.uri;
-
 function notify(title: string, message: string) {
   // Alert.alert is a no-op on web.
   if (Platform.OS === "web") window.alert(`${title}\n\n${message}`);
   else Alert.alert(title, message);
 }
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 export function EquipmentUploadForm() {
-  const [images, setImages] = useState<ImagePicker.ImagePickerAsset[]>([]);
-  const [brand, setBrand] = useState("");
-  const [model, setModel] = useState("");
-  const upload = useEquipmentUpload();
+  const draft = useEquipmentDraft({ maxImages: MAX_IMAGES });
+  const { images, brand, model, resume } = draft;
+  const upload = useEquipmentUpload({ resume, onResumeChange: draft.setResume });
   const network = useNetworkState();
 
   const offline = network.isConnected === false;
   const busy = upload.phase === "uploading";
-  const doneCount = upload.statuses.filter((s) => s === "done").length;
-  const canSubmit =
-    images.length > 0 && brand.trim() !== "" && model.trim() !== "" && !busy;
-  const canResume =
-    upload.phase === "error" &&
-    !(upload.error instanceof UploadError && upload.error.kind === "rejected");
+  const fingerprint = fingerprintOf(images, brand, model);
+  // Resume info only applies while the photos and fields are unchanged.
+  const activeResume = resume?.fingerprint === fingerprint ? resume : null;
+  const queued = !!activeResume?.queued && !busy;
+  const sentIds = new Set(activeResume?.sentIds ?? []);
+  const statusOf = (i: number): ImageUploadStatus | undefined =>
+    upload.statuses[i] ?? (sentIds.has(images[i].id) ? "done" : undefined);
+  const sentCount = images.filter((_, i) => statusOf(i) === "done").length;
 
-  // Editing the form after an attempt clears the per-photo status. Resume
+  const formValid = images.length > 0 && brand.trim() !== "" && model.trim() !== "";
+  const canSubmit = formValid && !busy && !draft.importing && !queued;
+  const rejected = upload.error instanceof UploadError && upload.error.kind === "rejected";
+  const canResume = !rejected && (upload.phase === "error" || (!!activeResume && sentCount > 0));
+
+  // Tell the user once if saved photos were lost (e.g. app storage cleared).
+  useEffect(() => {
+    if (draft.missingOnLoad > 0) {
+      notify(
+        "Some photos are missing",
+        `${plural(draft.missingOnLoad, "saved photo")} could no longer be found and ${draft.missingOnLoad === 1 ? "was" : "were"} removed.`,
+      );
+    }
+  }, [draft.missingOnLoad]);
+
+  // Offline-first: a queued submission starts by itself once we're online,
+  // including right after app launch.
+  const { start } = upload;
+  const autoStartRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!queued || !formValid || network.isConnected !== true) return;
+    if (autoStartRef.current === fingerprint) return; // one auto-attempt per connection
+    autoStartRef.current = fingerprint;
+    start(images, brand, model).then((session) => session && onUploaded(session.totalImages));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queued, formValid, network.isConnected, fingerprint]);
+  useEffect(() => {
+    if (network.isConnected === false) autoStartRef.current = null;
+  }, [network.isConnected]);
+
+  function onUploaded(count: number) {
+    notify("Uploaded", `${brand.trim()} ${model.trim()} was uploaded with ${plural(count, "photo")}.`);
+    upload.reset();
+    draft.clearAll();
+  }
+
+  // Editing the form after an attempt clears the on-screen status. Resume
   // still works if the photos and fields end up unchanged.
   function edit<T>(setter: (v: T) => void) {
     return (v: T) => {
@@ -75,22 +113,13 @@ export function EquipmentUploadForm() {
     };
   }
 
-  function addImages(assets: ImagePicker.ImagePickerAsset[]) {
+  async function addImages(assets: ImagePicker.ImagePickerAsset[]) {
     upload.dismiss();
-    setImages((prev) => {
-      const seen = new Set(prev.map(assetKey));
-      const next = [...prev, ...assets.filter((a) => !seen.has(assetKey(a)))];
-      if (next.length > MAX_IMAGES) {
-        notify("Too many photos", `You can upload at most ${MAX_IMAGES} photos.`);
-        return next.slice(0, MAX_IMAGES);
-      }
-      return next;
-    });
-  }
-
-  function removeImage(key: string) {
-    upload.dismiss();
-    setImages((prev) => prev.filter((a) => assetKey(a) !== key));
+    const r = await draft.addAssets(assets);
+    const problems: string[] = [];
+    if (r.overLimit) problems.push(`${plural(r.overLimit, "photo")} skipped: the limit is ${MAX_IMAGES}.`);
+    if (r.failed) problems.push(`${plural(r.failed, "photo")} couldn't be saved. Your device may be out of storage.`);
+    if (problems.length) notify("Some photos weren't added", problems.join("\n"));
   }
 
   async function pickFromLibrary() {
@@ -99,8 +128,11 @@ export function EquipmentUploadForm() {
       notify("Permission needed", "Allow photo library access to choose images.");
       return;
     }
-    const result = await ImagePicker.launchImageLibraryAsync(LIBRARY_OPTIONS);
-    if (!result.canceled) addImages(result.assets);
+    const result = await ImagePicker.launchImageLibraryAsync({
+      ...LIBRARY_OPTIONS,
+      selectionLimit: Math.max(1, MAX_IMAGES - images.length),
+    });
+    if (!result.canceled) await addImages(result.assets);
   }
 
   async function takePhoto() {
@@ -109,29 +141,25 @@ export function EquipmentUploadForm() {
       notify("Permission needed", "Allow camera access to take a photo.");
       return;
     }
+    let result: ImagePicker.ImagePickerResult;
     try {
       // The camera returns one photo per launch; each capture is appended.
-      const result = await ImagePicker.launchCameraAsync(CAMERA_OPTIONS);
-      if (!result.canceled) addImages(result.assets);
+      result = await ImagePicker.launchCameraAsync(CAMERA_OPTIONS);
     } catch {
       // e.g. iOS Simulator has no camera.
       notify("Camera unavailable", "This device has no camera available.");
+      return;
     }
+    if (!result.canceled) await addImages(result.assets);
   }
 
   async function submit() {
-    const b = brand.trim();
-    const m = model.trim();
-    const session = await upload.start(images, b, m);
-    if (!session) return; // error is shown inline
-    notify(
-      "Uploaded",
-      `${b} ${m} was uploaded with ${images.length} photo${images.length === 1 ? "" : "s"}.`,
-    );
-    upload.reset();
-    setImages([]);
-    setBrand("");
-    setModel("");
+    if (offline) {
+      upload.queue(images, brand, model);
+      return;
+    }
+    const session = await upload.start(images, brand, model);
+    if (session) onUploaded(session.totalImages);
   }
 
   let statusText: string | null = null;
@@ -145,11 +173,13 @@ export function EquipmentUploadForm() {
     } else statusText = "Starting upload…";
   }
 
-  const submitLabel = canResume
-    ? doneCount > 0
-      ? `Resume upload (${doneCount}/${images.length} sent)`
-      : "Try again"
-    : "Upload";
+  const submitLabel = offline
+    ? "Upload when online"
+    : canResume
+      ? sentCount > 0
+        ? `Resume upload (${sentCount}/${images.length} sent)`
+        : "Try again"
+      : "Upload";
 
   return (
     <KeyboardAvoidingView
@@ -160,7 +190,7 @@ export function EquipmentUploadForm() {
         <View style={styles.offlineBanner} accessibilityRole="alert">
           <Ionicons name="cloud-offline-outline" size={18} color="#fff" />
           <Text style={styles.offlineText}>
-            No connection. Uploads will continue when you&apos;re back online.
+            You&apos;re offline. Your work is saved on this device.
           </Text>
         </View>
       )}
@@ -168,17 +198,18 @@ export function EquipmentUploadForm() {
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
       >
-        {images.length > 0 ? (
+        {images.length > 0 || draft.importing ? (
           <>
             <View style={styles.galleryHeader}>
               <Text style={styles.galleryTitle}>
-                {images.length} photo{images.length === 1 ? "" : "s"}
+                {plural(images.length, "photo")}
+                {draft.importing ? " · saving…" : ""}
               </Text>
-              {!busy && (
+              {!busy && images.length > 0 && (
                 <Pressable
                   onPress={() => {
                     upload.dismiss();
-                    setImages([]);
+                    draft.clearImages();
                   }}
                   accessibilityRole="button"
                   hitSlop={8}
@@ -188,31 +219,38 @@ export function EquipmentUploadForm() {
               )}
             </View>
             <View style={styles.grid}>
-              {images.map((img, i) => {
-                const key = assetKey(img);
-                return (
-                  <View key={key} style={styles.cell}>
-                    <Image
-                      source={{ uri: img.uri }}
-                      style={styles.thumb}
-                      resizeMode="cover"
-                      accessibilityLabel={`Photo ${i + 1}`}
-                    />
-                    <StatusOverlay status={upload.statuses[i]} />
-                    {!busy && (
-                      <Pressable
-                        onPress={() => removeImage(key)}
-                        accessibilityRole="button"
-                        accessibilityLabel={`Remove photo ${i + 1}`}
-                        hitSlop={8}
-                        style={styles.removeButton}
-                      >
-                        <Ionicons name="close" size={16} color="#fff" />
-                      </Pressable>
-                    )}
+              {images.map((img, i) => (
+                <View key={img.id} style={styles.cell}>
+                  <Image
+                    source={{ uri: img.uri }}
+                    style={styles.thumb}
+                    resizeMode="cover"
+                    accessibilityLabel={`Photo ${i + 1}`}
+                  />
+                  <StatusOverlay status={statusOf(i)} />
+                  {!busy && (
+                    <Pressable
+                      onPress={() => {
+                        upload.dismiss();
+                        draft.removeImage(img.id);
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Remove photo ${i + 1}`}
+                      hitSlop={8}
+                      style={styles.removeButton}
+                    >
+                      <Ionicons name="close" size={16} color="#fff" />
+                    </Pressable>
+                  )}
+                </View>
+              ))}
+              {draft.importing && (
+                <View style={styles.cell}>
+                  <View style={[styles.thumb, styles.importing]}>
+                    <ActivityIndicator color={colors.textMuted} />
                   </View>
-                );
-              })}
+                </View>
+              )}
             </View>
           </>
         ) : (
@@ -229,13 +267,13 @@ export function EquipmentUploadForm() {
             icon="images-outline"
             label="Upload"
             onPress={pickFromLibrary}
-            disabled={busy}
+            disabled={busy || images.length >= MAX_IMAGES}
           />
           <ImageButton
             icon="camera-outline"
             label="Camera"
             onPress={takePhoto}
-            disabled={busy}
+            disabled={busy || images.length >= MAX_IMAGES}
           />
         </View>
 
@@ -243,7 +281,7 @@ export function EquipmentUploadForm() {
         <TextInput
           style={styles.input}
           value={brand}
-          onChangeText={edit(setBrand)}
+          onChangeText={edit(draft.setBrand)}
           editable={!busy}
           maxLength={100}
           placeholder="e.g. Caterpillar"
@@ -256,7 +294,7 @@ export function EquipmentUploadForm() {
         <TextInput
           style={styles.input}
           value={model}
-          onChangeText={edit(setModel)}
+          onChangeText={edit(draft.setModel)}
           editable={!busy}
           maxLength={100}
           placeholder="e.g. 320 Excavator"
@@ -265,42 +303,67 @@ export function EquipmentUploadForm() {
           returnKeyType="done"
         />
 
-        {upload.phase === "error" && (
+        {!draft.persistsImages && images.length > 0 && (
+          <Text style={styles.hint}>
+            In the browser, photos aren&apos;t kept after a reload. Brand and model are saved.
+          </Text>
+        )}
+
+        {upload.phase === "error" && !queued && (
           <View style={styles.errorBox} accessibilityRole="alert">
             <Ionicons name="alert-circle" size={20} color={DANGER} />
             <Text style={styles.errorText}>
               {describeUploadError(upload.error)}
-              {doneCount > 0 && canResume
-                ? ` ${doneCount} of ${images.length} photos are already on the server.`
+              {sentCount > 0 && canResume
+                ? ` ${sentCount} of ${images.length} photos are already on the server.`
                 : ""}
             </Text>
           </View>
         )}
 
-        <Pressable
-          onPress={submit}
-          disabled={!canSubmit}
-          accessibilityRole="button"
-          accessibilityState={{ disabled: !canSubmit, busy }}
-          style={({ pressed }) => [
-            styles.submit,
-            !canSubmit && styles.submitDisabled,
-            pressed && styles.pressed,
-          ]}
-        >
-          {busy ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <>
-              <Ionicons
-                name={canResume ? "refresh" : "cloud-upload-outline"}
-                size={20}
-                color="#fff"
-              />
-              <Text style={styles.submitText}>{submitLabel}</Text>
-            </>
-          )}
-        </Pressable>
+        {queued ? (
+          <View style={styles.queuedBox} accessibilityRole="alert">
+            <Ionicons name="time-outline" size={20} color={colors.primary} />
+            <Text style={styles.queuedText}>
+              Saved on this device. It will upload automatically when you&apos;re back online.
+            </Text>
+          </View>
+        ) : (
+          <Pressable
+            onPress={submit}
+            disabled={!canSubmit}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: !canSubmit, busy }}
+            style={({ pressed }) => [
+              styles.submit,
+              !canSubmit && styles.submitDisabled,
+              pressed && styles.pressed,
+            ]}
+          >
+            {busy ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <>
+                <Ionicons
+                  name={offline ? "time-outline" : canResume ? "refresh" : "cloud-upload-outline"}
+                  size={20}
+                  color="#fff"
+                />
+                <Text style={styles.submitText}>{submitLabel}</Text>
+              </>
+            )}
+          </Pressable>
+        )}
+
+        {queued && (
+          <Pressable
+            onPress={() => draft.setResume(activeResume && { ...activeResume, queued: false })}
+            accessibilityRole="button"
+            style={({ pressed }) => [styles.cancel, pressed && styles.pressed]}
+          >
+            <Text style={styles.cancelText}>Don&apos;t upload automatically</Text>
+          </Pressable>
+        )}
 
         {busy && (
           <>
@@ -490,5 +553,18 @@ const styles = StyleSheet.create({
   statusText: { textAlign: "center", color: colors.textMuted },
   cancel: { alignSelf: "center", padding: spacing.sm },
   cancelText: { color: DANGER, fontWeight: "600" },
+  hint: { color: colors.textMuted, fontSize: 13 },
+  importing: { alignItems: "center", justifyContent: "center" },
+  queuedBox: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginTop: spacing.lg,
+    padding: spacing.md,
+    borderRadius: 10,
+    backgroundColor: "#EFF6FF",
+    borderWidth: 1,
+    borderColor: "#BFDBFE",
+  },
+  queuedText: { flex: 1, color: colors.text },
   pressed: { opacity: 0.7 },
 });

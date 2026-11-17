@@ -1,4 +1,3 @@
-import type { ImagePickerAsset } from "expo-image-picker";
 import { Platform } from "react-native";
 
 import { UploadError } from "./api/errors";
@@ -18,8 +17,17 @@ export type UploadEvent =
   | { type: "image"; index: number; status: "uploading" | "done" | "failed" }
   | ({ type: "retry"; index?: number } & RetryInfo);
 
+/** What the uploader needs from an image (StoredImage satisfies this). */
+export type UploadImage = {
+  uri: string;
+  fileName?: string | null;
+  mimeType?: string | null;
+  /** Web: the browser File to send. */
+  file?: Blob;
+};
+
 export type EquipmentUpload = {
-  images: ImagePickerAsset[];
+  images: UploadImage[];
   brand: string;
   model: string;
   /** Resume this server-side upload, skipping images it already has. */
@@ -33,7 +41,7 @@ export type EquipmentUpload = {
 const CREATE_TIMEOUT_MS = 10_000;
 const IMAGE_TIMEOUT_MS = 30_000;
 
-function imageForm(image: ImagePickerAsset, index: number): FormData {
+function imageForm(image: UploadImage, index: number): FormData {
   const name = image.fileName ?? `equipment-${index}.jpg`;
   const type = image.mimeType ?? "image/jpeg";
   const form = new FormData();
