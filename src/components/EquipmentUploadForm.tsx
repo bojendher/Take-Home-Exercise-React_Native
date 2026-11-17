@@ -1,7 +1,7 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
 import * as ImagePicker from "expo-image-picker";
 import { useNetworkState } from "expo-network";
-import { useEffect, useRef, type ComponentProps } from "react";
+import { useEffect, useRef, useState, type ComponentProps } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -15,6 +15,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 import { colors, spacing } from "@/constants/theme";
 import { useEquipmentDraft } from "@/hooks/useEquipmentDraft";
@@ -54,7 +55,11 @@ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 export function EquipmentUploadForm() {
   const draft = useEquipmentDraft({ maxImages: MAX_IMAGES });
   const { images, brand, model, resume } = draft;
-  const upload = useEquipmentUpload({ resume, onResumeChange: draft.setResume });
+  const upload = useEquipmentUpload({
+    resume,
+    onResumeChange: draft.setResume,
+    onSuccess: (session) => onUploaded(session.totalImages),
+  });
   const network = useNetworkState();
 
   const offline = network.isConnected === false;
@@ -68,10 +73,14 @@ export function EquipmentUploadForm() {
     upload.statuses[i] ?? (sentIds.has(images[i].id) ? "done" : undefined);
   const sentCount = images.filter((_, i) => statusOf(i) === "done").length;
 
-  const formValid = images.length > 0 && brand.trim() !== "" && model.trim() !== "";
+  const formValid =
+    images.length > 0 && brand.trim() !== "" && model.trim() !== "";
   const canSubmit = formValid && !busy && !draft.importing && !queued;
-  const rejected = upload.error instanceof UploadError && upload.error.kind === "rejected";
-  const canResume = !rejected && (upload.phase === "error" || (!!activeResume && sentCount > 0));
+  const rejected =
+    upload.error instanceof UploadError && upload.error.kind === "rejected";
+  const canResume =
+    !rejected &&
+    (upload.phase === "error" || (!!activeResume && sentCount > 0));
 
   // Tell the user once if saved photos were lost (e.g. app storage cleared).
   useEffect(() => {
@@ -91,7 +100,7 @@ export function EquipmentUploadForm() {
     if (!queued || !formValid || network.isConnected !== true) return;
     if (autoStartRef.current === fingerprint) return; // one auto-attempt per connection
     autoStartRef.current = fingerprint;
-    start(images, brand, model).then((session) => session && onUploaded(session.totalImages));
+    start(images, brand, model);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queued, formValid, network.isConnected, fingerprint]);
   useEffect(() => {
@@ -99,7 +108,10 @@ export function EquipmentUploadForm() {
   }, [network.isConnected]);
 
   function onUploaded(count: number) {
-    notify("Uploaded", `${brand.trim()} ${model.trim()} was uploaded with ${plural(count, "photo")}.`);
+    notify(
+      "Uploaded",
+      `${brand.trim()} ${model.trim()} was uploaded with ${plural(count, "photo")}.`,
+    );
     upload.reset();
     draft.clearAll();
   }
@@ -117,15 +129,25 @@ export function EquipmentUploadForm() {
     upload.dismiss();
     const r = await draft.addAssets(assets);
     const problems: string[] = [];
-    if (r.overLimit) problems.push(`${plural(r.overLimit, "photo")} skipped: the limit is ${MAX_IMAGES}.`);
-    if (r.failed) problems.push(`${plural(r.failed, "photo")} couldn't be saved. Your device may be out of storage.`);
-    if (problems.length) notify("Some photos weren't added", problems.join("\n"));
+    if (r.overLimit)
+      problems.push(
+        `${plural(r.overLimit, "photo")} skipped: the limit is ${MAX_IMAGES}.`,
+      );
+    if (r.failed)
+      problems.push(
+        `${plural(r.failed, "photo")} couldn't be saved. Your device may be out of storage.`,
+      );
+    if (problems.length)
+      notify("Some photos weren't added", problems.join("\n"));
   }
 
   async function pickFromLibrary() {
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!perm.granted) {
-      notify("Permission needed", "Allow photo library access to choose images.");
+      notify(
+        "Permission needed",
+        "Allow photo library access to choose images.",
+      );
       return;
     }
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -158,15 +180,19 @@ export function EquipmentUploadForm() {
       upload.queue(images, brand, model);
       return;
     }
-    const session = await upload.start(images, brand, model);
-    if (session) onUploaded(session.totalImages);
+    await upload.start(images, brand, model);
   }
 
   let statusText: string | null = null;
   if (busy) {
     if (offline) statusText = "You're offline. Waiting for connection…";
+    else if (upload.autoRetry)
+      statusText = null; // shown by <AutoRetryNotice>
     else if (upload.retry) {
-      const what = upload.retry.index != null ? `photo ${upload.retry.index + 1}` : "request";
+      const what =
+        upload.retry.index != null
+          ? `photo ${upload.retry.index + 1}`
+          : "request";
       statusText = `Problem sending ${what}. Retrying in ${Math.ceil(upload.retry.delayMs / 1000)}s (attempt ${upload.retry.attempt + 1})…`;
     } else if (upload.current != null) {
       statusText = `Uploading photo ${upload.current + 1} of ${images.length}…`;
@@ -182,205 +208,282 @@ export function EquipmentUploadForm() {
       : "Upload";
 
   return (
-    <KeyboardAvoidingView
-      style={styles.flex}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      {offline && (
-        <View style={styles.offlineBanner} accessibilityRole="alert">
-          <Ionicons name="cloud-offline-outline" size={18} color="#fff" />
-          <Text style={styles.offlineText}>
-            You&apos;re offline. Your work is saved on this device.
-          </Text>
-        </View>
-      )}
-      <ScrollView
-        contentContainerStyle={styles.content}
-        keyboardShouldPersistTaps="handled"
+    <SafeAreaView style={styles.flex} edges={["top"]}>
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
-        {images.length > 0 || draft.importing ? (
-          <>
-            <View style={styles.galleryHeader}>
-              <Text style={styles.galleryTitle}>
-                {plural(images.length, "photo")}
-                {draft.importing ? " · saving…" : ""}
-              </Text>
-              {!busy && images.length > 0 && (
-                <Pressable
-                  onPress={() => {
-                    upload.dismiss();
-                    draft.clearImages();
-                  }}
-                  accessibilityRole="button"
-                  hitSlop={8}
-                >
-                  <Text style={styles.clearText}>Clear all</Text>
-                </Pressable>
-              )}
-            </View>
-            <View style={styles.grid}>
-              {images.map((img, i) => (
-                <View key={img.id} style={styles.cell}>
-                  <Image
-                    source={{ uri: img.uri }}
-                    style={styles.thumb}
-                    resizeMode="cover"
-                    accessibilityLabel={`Photo ${i + 1}`}
-                  />
-                  <StatusOverlay status={statusOf(i)} />
-                  {!busy && (
-                    <Pressable
-                      onPress={() => {
-                        upload.dismiss();
-                        draft.removeImage(img.id);
-                      }}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Remove photo ${i + 1}`}
-                      hitSlop={8}
-                      style={styles.removeButton}
-                    >
-                      <Ionicons name="close" size={16} color="#fff" />
-                    </Pressable>
-                  )}
-                </View>
-              ))}
-              {draft.importing && (
-                <View style={styles.cell}>
-                  <View style={[styles.thumb, styles.importing]}>
-                    <ActivityIndicator color={colors.textMuted} />
+        {offline && (
+          <View style={styles.offlineBanner} accessibilityRole="alert">
+            <Ionicons name="cloud-offline-outline" size={18} color="#fff" />
+            <Text style={styles.offlineText}>
+              You&apos;re offline. Your work is saved on this device.
+            </Text>
+          </View>
+        )}
+        <ScrollView
+          contentContainerStyle={styles.content}
+          keyboardShouldPersistTaps="handled"
+        >
+          {images.length > 0 || draft.importing ? (
+            <>
+              <View style={styles.galleryHeader}>
+                <Text style={styles.galleryTitle}>
+                  {plural(images.length, "photo")}
+                  {draft.importing ? " · saving…" : ""}
+                </Text>
+                {!busy && images.length > 0 && (
+                  <Pressable
+                    onPress={() => {
+                      upload.dismiss();
+                      draft.clearImages();
+                    }}
+                    accessibilityRole="button"
+                    hitSlop={8}
+                  >
+                    <Text style={styles.clearText}>Clear all</Text>
+                  </Pressable>
+                )}
+              </View>
+              <View style={styles.grid}>
+                {images.map((img, i) => (
+                  <View key={img.id} style={styles.cell}>
+                    <Image
+                      source={{ uri: img.uri }}
+                      style={styles.thumb}
+                      resizeMode="cover"
+                      accessibilityLabel={`Photo ${i + 1}`}
+                    />
+                    <StatusOverlay status={statusOf(i)} />
+                    {!busy && (
+                      <Pressable
+                        onPress={() => {
+                          upload.dismiss();
+                          draft.removeImage(img.id);
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Remove photo ${i + 1}`}
+                        hitSlop={8}
+                        style={styles.removeButton}
+                      >
+                        <Ionicons name="close" size={16} color="#fff" />
+                      </Pressable>
+                    )}
                   </View>
-                </View>
-              )}
-            </View>
-          </>
-        ) : (
-          <View style={styles.preview}>
-            <View style={styles.previewEmpty}>
-              <Ionicons name="images-outline" size={48} color={colors.textMuted} />
-              <Text style={styles.muted}>No photos yet</Text>
-            </View>
-          </View>
-        )}
-
-        <View style={styles.row}>
-          <ImageButton
-            icon="images-outline"
-            label="Upload"
-            onPress={pickFromLibrary}
-            disabled={busy || images.length >= MAX_IMAGES}
-          />
-          <ImageButton
-            icon="camera-outline"
-            label="Camera"
-            onPress={takePhoto}
-            disabled={busy || images.length >= MAX_IMAGES}
-          />
-        </View>
-
-        <Text style={styles.label}>Brand</Text>
-        <TextInput
-          style={styles.input}
-          value={brand}
-          onChangeText={edit(draft.setBrand)}
-          editable={!busy}
-          maxLength={100}
-          placeholder="e.g. Caterpillar"
-          placeholderTextColor={colors.textMuted}
-          autoCapitalize="words"
-          returnKeyType="next"
-        />
-
-        <Text style={styles.label}>Model</Text>
-        <TextInput
-          style={styles.input}
-          value={model}
-          onChangeText={edit(draft.setModel)}
-          editable={!busy}
-          maxLength={100}
-          placeholder="e.g. 320 Excavator"
-          placeholderTextColor={colors.textMuted}
-          autoCapitalize="characters"
-          returnKeyType="done"
-        />
-
-        {!draft.persistsImages && images.length > 0 && (
-          <Text style={styles.hint}>
-            In the browser, photos aren&apos;t kept after a reload. Brand and model are saved.
-          </Text>
-        )}
-
-        {upload.phase === "error" && !queued && (
-          <View style={styles.errorBox} accessibilityRole="alert">
-            <Ionicons name="alert-circle" size={20} color={DANGER} />
-            <Text style={styles.errorText}>
-              {describeUploadError(upload.error)}
-              {sentCount > 0 && canResume
-                ? ` ${sentCount} of ${images.length} photos are already on the server.`
-                : ""}
-            </Text>
-          </View>
-        )}
-
-        {queued ? (
-          <View style={styles.queuedBox} accessibilityRole="alert">
-            <Ionicons name="time-outline" size={20} color={colors.primary} />
-            <Text style={styles.queuedText}>
-              Saved on this device. It will upload automatically when you&apos;re back online.
-            </Text>
-          </View>
-        ) : (
-          <Pressable
-            onPress={submit}
-            disabled={!canSubmit}
-            accessibilityRole="button"
-            accessibilityState={{ disabled: !canSubmit, busy }}
-            style={({ pressed }) => [
-              styles.submit,
-              !canSubmit && styles.submitDisabled,
-              pressed && styles.pressed,
-            ]}
-          >
-            {busy ? (
-              <ActivityIndicator color="#fff" />
-            ) : (
-              <>
+                ))}
+                {draft.importing && (
+                  <View style={styles.cell}>
+                    <View style={[styles.thumb, styles.importing]}>
+                      <ActivityIndicator color={colors.textMuted} />
+                    </View>
+                  </View>
+                )}
+              </View>
+            </>
+          ) : (
+            <View style={styles.preview}>
+              <View style={styles.previewEmpty}>
                 <Ionicons
-                  name={offline ? "time-outline" : canResume ? "refresh" : "cloud-upload-outline"}
-                  size={20}
-                  color="#fff"
+                  name="images-outline"
+                  size={48}
+                  color={colors.textMuted}
                 />
-                <Text style={styles.submitText}>{submitLabel}</Text>
-              </>
-            )}
-          </Pressable>
-        )}
+                <Text style={styles.muted}>No photos yet</Text>
+              </View>
+            </View>
+          )}
 
-        {queued && (
-          <Pressable
-            onPress={() => draft.setResume(activeResume && { ...activeResume, queued: false })}
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.cancel, pressed && styles.pressed]}
-          >
-            <Text style={styles.cancelText}>Don&apos;t upload automatically</Text>
-          </Pressable>
-        )}
+          <View style={styles.row}>
+            <ImageButton
+              icon="images-outline"
+              label="Upload"
+              testID="pick-library"
+              onPress={pickFromLibrary}
+              disabled={busy || images.length >= MAX_IMAGES}
+            />
+            <ImageButton
+              icon="camera-outline"
+              label="Camera"
+              testID="take-photo"
+              onPress={takePhoto}
+              disabled={busy || images.length >= MAX_IMAGES}
+            />
+          </View>
 
-        {busy && (
-          <>
-            <Text style={styles.statusText} accessibilityLiveRegion="polite">
-              {statusText}
+          <Text style={styles.label}>Brand</Text>
+          <TextInput
+            style={styles.input}
+            testID="brand-input"
+            value={brand}
+            onChangeText={edit(draft.setBrand)}
+            editable={!busy}
+            maxLength={100}
+            placeholder="e.g. Caterpillar"
+            placeholderTextColor={colors.textMuted}
+            autoCapitalize="words"
+            returnKeyType="next"
+          />
+
+          <Text style={styles.label}>Model</Text>
+          <TextInput
+            style={styles.input}
+            testID="model-input"
+            value={model}
+            onChangeText={edit(draft.setModel)}
+            editable={!busy}
+            maxLength={100}
+            placeholder="e.g. 320 Excavator"
+            placeholderTextColor={colors.textMuted}
+            autoCapitalize="characters"
+            returnKeyType="done"
+          />
+
+          {!draft.persistsImages && images.length > 0 && (
+            <Text style={styles.hint}>
+              In the browser, photos aren&apos;t kept after a reload. Brand and
+              model are saved.
             </Text>
+          )}
+
+          {upload.phase === "error" && !queued && (
+            <View style={styles.errorBox} accessibilityRole="alert">
+              <Ionicons name="alert-circle" size={20} color={DANGER} />
+              <Text style={styles.errorText}>
+                {describeUploadError(upload.error)}
+                {sentCount > 0 && canResume
+                  ? ` ${sentCount} of ${images.length} photos are already on the server.`
+                  : ""}
+              </Text>
+            </View>
+          )}
+
+          {queued ? (
+            <View style={styles.queuedBox} accessibilityRole="alert">
+              <Ionicons name="time-outline" size={20} color={colors.primary} />
+              <Text style={styles.queuedText}>
+                Saved on this device. It will upload automatically when
+                you&apos;re back online.
+              </Text>
+            </View>
+          ) : (
             <Pressable
-              onPress={upload.cancel}
+              testID="submit-upload"
+              onPress={submit}
+              disabled={!canSubmit}
               accessibilityRole="button"
-              style={({ pressed }) => [styles.cancel, pressed && styles.pressed]}
+              accessibilityState={{ disabled: !canSubmit, busy }}
+              style={({ pressed }) => [
+                styles.submit,
+                !canSubmit && styles.submitDisabled,
+                pressed && styles.pressed,
+              ]}
             >
-              <Text style={styles.cancelText}>Cancel</Text>
+              {busy ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <>
+                  <Ionicons
+                    name={
+                      offline
+                        ? "time-outline"
+                        : canResume
+                          ? "refresh"
+                          : "cloud-upload-outline"
+                    }
+                    size={20}
+                    color="#fff"
+                  />
+                  <Text style={styles.submitText}>{submitLabel}</Text>
+                </>
+              )}
             </Pressable>
-          </>
-        )}
-      </ScrollView>
-    </KeyboardAvoidingView>
+          )}
+
+          {queued && (
+            <Pressable
+              onPress={() =>
+                draft.setResume(
+                  activeResume && { ...activeResume, queued: false },
+                )
+              }
+              accessibilityRole="button"
+              style={({ pressed }) => [
+                styles.cancel,
+                pressed && styles.pressed,
+              ]}
+            >
+              <Text style={styles.cancelText}>
+                Don&apos;t upload automatically
+              </Text>
+            </Pressable>
+          )}
+
+          {busy && (
+            <>
+              {upload.autoRetry && !offline ? (
+                <AutoRetryNotice
+                  retry={upload.autoRetry}
+                  onRetryNow={upload.retryNow}
+                />
+              ) : (
+                <Text
+                  style={styles.statusText}
+                  accessibilityLiveRegion="polite"
+                >
+                  {statusText}
+                </Text>
+              )}
+              <Pressable
+                onPress={upload.cancel}
+                accessibilityRole="button"
+                style={({ pressed }) => [
+                  styles.cancel,
+                  pressed && styles.pressed,
+                ]}
+              >
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+            </>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+function AutoRetryNotice({
+  retry,
+  onRetryNow,
+}: {
+  retry: NonNullable<ReturnType<typeof useEquipmentUpload>["autoRetry"]>;
+  onRetryNow: () => void;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const secs = Math.max(0, Math.ceil((retry.retryAt - now) / 1000));
+
+  return (
+    <View style={styles.retryBox} accessibilityLiveRegion="polite">
+      <Text style={styles.retryText}>
+        {describeUploadError(retry.error).split(". ")[0]}.{"\n"}
+        {secs > 0
+          ? `Retrying automatically in ${secs}s (attempt ${retry.attempt} of ${retry.maxAttempts})…`
+          : "Retrying…"}
+      </Text>
+      {secs > 0 && (
+        <Pressable
+          onPress={onRetryNow}
+          accessibilityRole="button"
+          hitSlop={8}
+          style={({ pressed }) => pressed && styles.pressed}
+        >
+          <Text style={styles.retryNowText}>Retry now</Text>
+        </Pressable>
+      )}
+    </View>
   );
 }
 
@@ -392,8 +495,12 @@ function StatusOverlay({ status }: { status?: ImageUploadStatus }) {
       pointerEvents="none"
     >
       {status === "uploading" && <ActivityIndicator color="#fff" />}
-      {status === "pending" && <Ionicons name="time-outline" size={22} color="#fff" />}
-      {status === "failed" && <Ionicons name="alert-circle" size={26} color={DANGER} />}
+      {status === "pending" && (
+        <Ionicons name="time-outline" size={22} color="#fff" />
+      )}
+      {status === "failed" && (
+        <Ionicons name="alert-circle" size={26} color={DANGER} />
+      )}
       {status === "done" && (
         <View style={styles.doneBadge}>
           <Ionicons name="checkmark" size={14} color="#fff" />
@@ -408,11 +515,19 @@ type ImageButtonProps = {
   label: string;
   onPress: () => void;
   disabled?: boolean;
+  testID?: string;
 };
 
-function ImageButton({ icon, label, onPress, disabled }: ImageButtonProps) {
+function ImageButton({
+  icon,
+  label,
+  onPress,
+  disabled,
+  testID,
+}: ImageButtonProps) {
   return (
     <Pressable
+      testID={testID}
       onPress={onPress}
       disabled={disabled}
       accessibilityRole="button"
@@ -554,6 +669,18 @@ const styles = StyleSheet.create({
   cancel: { alignSelf: "center", padding: spacing.sm },
   cancelText: { color: DANGER, fontWeight: "600" },
   hint: { color: colors.textMuted, fontSize: 13 },
+  retryBox: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    padding: spacing.md,
+    borderRadius: 10,
+    backgroundColor: "#FFFBEB",
+    borderWidth: 1,
+    borderColor: "#FDE68A",
+  },
+  retryText: { flex: 1, color: "#92400E" },
+  retryNowText: { color: colors.primary, fontWeight: "700" },
   importing: { alignItems: "center", justifyContent: "center" },
   queuedBox: {
     flexDirection: "row",

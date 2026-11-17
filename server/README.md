@@ -108,9 +108,20 @@ probabilities from 0 to 1, and their sum should be at most 1.
 See `src/lib/api/` and `src/lib/uploadEquipment.ts`.
 
 - **Per-request timeout**: 10s for create/complete, 30s per image.
-- **Retries**: 3 per request, exponential backoff with jitter (0.5s → 8s), and
-  `Retry-After` is honoured. Only network errors, timeouts, 408/425/429 and 5xx
-  are retried. Other 4xx errors fail immediately with the server's message.
+- **Retries, two layers** (`src/lib/api/retry.ts`). Both use exponential
+  backoff with "equal jitter", meaning a random delay between half and all of the
+  computed value.
+  1. *Per request*: 3 retries at 0.5s → 1s → 2s (capped at 8s). A server
+     `Retry-After` header overrides the delay, up to 30s.
+  2. *Per upload*: if the requests still give up (server down, unreachable,
+     timing out), the whole upload is retried automatically up to 5 times at
+     5s → 10s → 20s → 40s → 60s. Each retry resumes the same server session, so
+     images that were already sent are skipped. The app shows a countdown with
+     **Retry now** and **Cancel**.
+
+  Only network errors, timeouts, 408/425/429 and 5xx are retried. Other 4xx
+  errors fail immediately with the server's message. Being offline isn't
+  retried on a timer: the upload waits for the connection to return instead.
 - **Offline**: before each attempt the app checks `expo-network`. If the device
   is offline, it waits up to 60s for the connection to return, then fails as
   "offline". An offline banner is shown in the meantime.

@@ -59,8 +59,11 @@ export function describeUploadError(e: unknown): string {
       return "No upload server is configured. Set EXPO_PUBLIC_API_URL.";
     case "offline":
       return "You're offline. Reconnect and tap Resume — photos already sent won't be re-sent.";
-    case "unreachable":
-      return "Can't reach the upload server. It may be down — check it's running, then tap Resume.";
+    case "unreachable": {
+      const url = typeof e.details?.url === "string" ? ` at ${e.details.url}` : "";
+      const cause = __DEV__ && typeof e.details?.cause === "string" ? ` (${e.details.cause})` : "";
+      return `Can't reach the upload server${url}${cause}. It may be down — check it's running, then tap Resume.`;
+    }
     case "timeout":
       return "The server took too long to respond. Tap Resume to try again.";
     case "server":

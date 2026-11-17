@@ -22,9 +22,13 @@
     "react-native-web": "^0.21.4"
   },
   "devDependencies": {
+    "@testing-library/react-native": "^14.1.0",
+    "@types/jest": "30.0.0",
     "@types/react": "~19.3.0",
     "eslint": "^9.0.0",
     "eslint-config-expo": "~58.0.4",
+    "jest": "~30.5.2",
+    "jest-expo": "~58.0.15",
     "typescript": "~6.0.3"
   },
   "scripts": {
@@ -36,7 +40,23 @@
     "lint": "expo lint",
     "server": "node server/index.mjs",
     "server:flaky": "SIM_PRESET=flaky node server/index.mjs",
-    "test:server": "node --test server/app.test.mjs"
+    "test:server": "node --test server/app.test.mjs",
+    "test": "jest",
+    "test:integration": "node --test --import ./tests/support/register.mjs 'tests/integration/*.test.mjs'",
+    "test:all": "npm run test && npm run test:integration && npm run test:server"
   },
-  "private": true
+  "private": true,
+  "jest": {
+    "preset": "jest-expo",
+    "testMatch": [
+      "<rootDir>/__tests__/**/*-test.ts?(x)"
+    ],
+    "moduleNameMapper": {
+      "^@/(.*)$": "<rootDir>/src/$1",
+      "^expo-asset$": "<rootDir>/node_modules/expo/node_modules/expo-asset"
+    },
+    "setupFilesAfterEnv": [
+      "<rootDir>/__tests__/support/setup.ts"
+    ]
+  }
 }

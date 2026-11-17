@@ -1,6 +1,9 @@
+import { fetch } from "expo/fetch";
+
 import { getApiBaseUrl } from "./config";
 import { UploadError, isRetryableStatus } from "./errors";
 import { isOffline, waitForOnline } from "./network";
+import { REQUEST_BACKOFF, backoffDelay, sleep, type BackoffPolicy } from "./retry";
 
 export type RetryInfo = { attempt: number; delayMs: number; error: UploadError };
 
@@ -13,45 +16,60 @@ export type RequestOptions = {
   headers?: Record<string, string>;
   timeoutMs: number;
   signal?: AbortSignal;
-  /** Number of retries after the first attempt. */
+  /** Number of retries after the first attempt. Default 3. */
   retries?: number;
+  /** Delay schedule between retries. Default REQUEST_BACKOFF. */
+  backoff?: BackoffPolicy;
   onRetry?: (info: RetryInfo) => void;
 };
 
-const BASE_DELAY_MS = 500;
-const MAX_DELAY_MS = 8_000;
 /** How long to wait for connectivity to come back before failing as "offline". */
 const OFFLINE_WAIT_MS = 60_000;
-
-function backoff(attempt: number): number {
-  const exp = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** attempt);
-  return Math.round(exp / 2 + Math.random() * (exp / 2)); // "equal jitter"
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(new UploadError("canceled", "Upload canceled"));
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new UploadError("canceled", "Upload canceled"));
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
+/** Never wait longer than this for a server-provided Retry-After. */
+const MAX_RETRY_AFTER_MS = 30_000;
 
 function parseRetryAfter(value: string | null): number | undefined {
   if (!value) return undefined;
   const secs = Number(value);
-  if (Number.isFinite(secs)) return Math.min(MAX_DELAY_MS * 4, Math.max(0, secs * 1000));
+  if (Number.isFinite(secs)) return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, secs * 1000));
   const date = Date.parse(value);
-  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+  return Number.isNaN(date) ? undefined : Math.min(MAX_RETRY_AFTER_MS, Math.max(0, date - Date.now()));
 }
 
+/**
+ * Did fetch fail in transport (no/broken connection), as opposed to a local
+ * problem preparing the request? Transport failures surface as:
+ *   expo/fetch → FetchError "fetch failed: …"
+ *   RN fetch   → TypeError "Network request failed"
+ *   browsers   → TypeError "Failed to fetch" / "NetworkError …" / "Load failed"
+ * Anything else (e.g. "Unsupported FormDataPart implementation") is a client
+ * bug and must not be reported as "server unreachable".
+ */
+export function isTransportError(e: unknown): boolean {
+  if (e instanceof TypeError) return true;
+  const message = e instanceof Error ? e.message : String(e);
+  return /^fetch failed|network request failed|failed to fetch|networkerror|load failed/i.test(message);
+}
+
+const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 async function attempt<T>(base: string, opts: RequestOptions): Promise<T> {
+  // Build the body first: failures here are local, not network problems.
+  const headers: Record<string, string> = { accept: "application/json", ...opts.headers };
+  let body: BodyInit | undefined;
+  try {
+    if (opts.form) body = opts.form();
+    else if (opts.json !== undefined) {
+      headers["content-type"] = "application/json";
+      body = JSON.stringify(opts.json);
+    }
+  } catch (e) {
+    if (e instanceof UploadError) throw e;
+    throw new UploadError("rejected", `Couldn't prepare the request: ${errorMessage(e)}`, {
+      code: "client_error",
+    });
+  }
+
   const ctrl = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -63,20 +81,28 @@ async function attempt<T>(base: string, opts: RequestOptions): Promise<T> {
 
   let res: Response;
   try {
-    const headers: Record<string, string> = { accept: "application/json", ...opts.headers };
-    let body: BodyInit | undefined;
-    if (opts.form) body = opts.form();
-    else if (opts.json !== undefined) {
-      headers["content-type"] = "application/json";
-      body = JSON.stringify(opts.json);
-    }
-    res = await fetch(`${base}${opts.path}`, { method: opts.method, headers, body, signal: ctrl.signal });
-  } catch {
+    res = (await fetch(`${base}${opts.path}`, {
+      method: opts.method,
+      headers,
+      body: body as never,
+      signal: ctrl.signal,
+    })) as unknown as Response;
+  } catch (e) {
     if (opts.signal?.aborted) throw new UploadError("canceled", "Upload canceled");
     if (timedOut) throw new UploadError("timeout", `No response within ${opts.timeoutMs / 1000}s`);
-    // fetch only rejects for transport failures: tell "offline" apart from "server down".
+    const cause = errorMessage(e);
+    if (!isTransportError(e)) {
+      // e.g. the fetch implementation can't encode this body. Retrying won't help.
+      throw new UploadError("rejected", `Couldn't send the request: ${cause}`, {
+        code: "client_error",
+        details: { cause },
+      });
+    }
+    // Transport failure: tell "offline" apart from "server down".
     if (await isOffline()) throw new UploadError("offline", "Device is offline");
-    throw new UploadError("unreachable", `Could not connect to ${base}`);
+    throw new UploadError("unreachable", `Could not connect to ${base}`, {
+      details: { url: base, cause },
+    });
   } finally {
     clearTimeout(timer);
     opts.signal?.removeEventListener("abort", onAbort);
@@ -112,7 +138,11 @@ async function attempt<T>(base: string, opts: RequestOptions): Promise<T> {
   );
 }
 
-/** fetch + per-attempt timeout + retries with backoff + offline waiting. */
+/**
+ * fetch + per-attempt timeout + retries with exponential backoff + offline waiting.
+ * Only transient failures are retried (network, timeout, 408/425/429/5xx);
+ * a server Retry-After overrides the computed delay.
+ */
 export async function request<T>(opts: RequestOptions): Promise<T> {
   const base = getApiBaseUrl();
   if (!base) throw new UploadError("not_configured", "No API URL configured");
@@ -128,7 +158,7 @@ export async function request<T>(opts: RequestOptions): Promise<T> {
         e instanceof UploadError ? e : new UploadError("unreachable", String(e));
       if (!error.retryable || n >= retries) throw error;
       // Offline: no point backing off; waitForOnline at the top handles it.
-      const delayMs = error.kind === "offline" ? 0 : (error.retryAfterMs ?? backoff(n));
+      const delayMs = error.kind === "offline" ? 0 : (error.retryAfterMs ?? backoffDelay(n, opts.backoff ?? REQUEST_BACKOFF));
       opts.onRetry?.({ attempt: n + 1, delayMs, error });
       await sleep(delayMs, opts.signal);
     }

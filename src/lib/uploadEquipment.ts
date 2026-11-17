@@ -1,7 +1,7 @@
-import { Platform } from "react-native";
-
 import { UploadError } from "./api/errors";
 import { request, type RetryInfo } from "./api/http";
+import { imagePart } from "./api/imagePart";
+import { UPLOAD_BACKOFF, backoffDelay, sleep, type BackoffPolicy, type Waker } from "./api/retry";
 
 export type UploadSession = {
   uploadId: string;
@@ -15,7 +15,18 @@ export type UploadSession = {
 export type UploadEvent =
   | { type: "session"; uploadId: string }
   | { type: "image"; index: number; status: "uploading" | "done" | "failed" }
-  | ({ type: "retry"; index?: number } & RetryInfo);
+  | ({ type: "retry"; index?: number } & RetryInfo)
+  | {
+      /** The whole upload failed; it will be retried automatically. */
+      type: "auto-retry";
+      /** 1-based number of the upcoming automatic retry. */
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      /** Epoch ms when the retry starts (for a countdown). */
+      retryAt: number;
+      error: UploadError;
+    };
 
 /** What the uploader needs from an image (StoredImage satisfies this). */
 export type UploadImage = {
@@ -42,15 +53,9 @@ const CREATE_TIMEOUT_MS = 10_000;
 const IMAGE_TIMEOUT_MS = 30_000;
 
 function imageForm(image: UploadImage, index: number): FormData {
-  const name = image.fileName ?? `equipment-${index}.jpg`;
-  const type = image.mimeType ?? "image/jpeg";
+  const { value, filename } = imagePart(image, `equipment-${index}.jpg`);
   const form = new FormData();
-  if (Platform.OS === "web" && image.file) {
-    form.append("image", image.file, name);
-  } else {
-    // React Native's FormData accepts a { uri, name, type } descriptor for files.
-    form.append("image", { uri: image.uri, name, type } as unknown as Blob);
-  }
+  form.append("image", value, filename);
   return form;
 }
 
@@ -164,6 +169,60 @@ export async function uploadEquipment(opts: EquipmentUpload): Promise<UploadSess
         return await complete();
       }
       throw e;
+    }
+  }
+}
+
+/**
+ * Upload failures worth retrying automatically. "offline" is excluded: the
+ * caller queues the upload until connectivity returns instead.
+ */
+const AUTO_RETRY_KINDS = new Set(["server", "unreachable", "timeout"]);
+
+export type AutoRetryOptions = {
+  /** Automatic retries of the whole upload after its requests gave up. Default 5. */
+  maxAutoRetries?: number;
+  backoff?: BackoffPolicy;
+  /** Wake the backoff wait early ("Retry now"). */
+  waker?: Waker;
+};
+
+/**
+ * Second retry layer. Each request already retries a few times with short
+ * backoff; if the upload still fails with a transient error (e.g. the server
+ * is down for a minute), wait with a longer exponential backoff and run the
+ * upload again, resuming the same server session so sent images are skipped.
+ */
+export async function uploadWithAutoRetry(
+  opts: EquipmentUpload & AutoRetryOptions,
+): Promise<UploadSession> {
+  const { maxAutoRetries = 5, backoff = UPLOAD_BACKOFF, waker, ...upload } = opts;
+  let resumeUploadId = upload.resumeUploadId;
+
+  for (let n = 0; ; n++) {
+    try {
+      return await uploadEquipment({
+        ...upload,
+        resumeUploadId,
+        onEvent: (event) => {
+          if (event.type === "session") resumeUploadId = event.uploadId;
+          upload.onEvent?.(event);
+        },
+      });
+    } catch (e) {
+      if (!(e instanceof UploadError) || !AUTO_RETRY_KINDS.has(e.kind) || n >= maxAutoRetries) {
+        throw e;
+      }
+      const delayMs = backoffDelay(n, backoff);
+      upload.onEvent?.({
+        type: "auto-retry",
+        attempt: n + 1,
+        maxAttempts: maxAutoRetries,
+        delayMs,
+        retryAt: Date.now() + delayMs,
+        error: e,
+      });
+      await sleep(delayMs, upload.signal, waker);
     }
   }
 }

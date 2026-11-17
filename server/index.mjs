@@ -3,6 +3,7 @@ import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { keepAdbReverse } from './adbReverse.mjs';
 import { createApp } from './app.mjs';
 import { PRESETS } from './simulate.mjs';
 
@@ -36,6 +37,7 @@ server.listen(PORT, HOST, () => {
   for (const addr of lan) console.log(`  LAN: ${addr}`);
   console.log(`  Simulation preset: ${SIM_PRESET}  (change at runtime: PUT /__sim)`);
   console.log(`  Files saved to: ${UPLOAD_DIR}`);
+  keepAdbReverse(PORT);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
