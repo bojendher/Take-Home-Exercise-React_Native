@@ -1,5 +1,6 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
 import * as ImagePicker from "expo-image-picker";
+import { useNetworkState } from "expo-network";
 import { useState, type ComponentProps } from "react";
 import {
   ActivityIndicator,
@@ -17,9 +18,13 @@ import {
 
 import { colors, spacing } from "@/constants/theme";
 import {
-  UploadNotConfiguredError,
-  uploadEquipment,
-} from "@/lib/uploadEquipment";
+  useEquipmentUpload,
+  type ImageUploadStatus,
+} from "@/hooks/useEquipmentUpload";
+import { UploadError, describeUploadError } from "@/lib/api/errors";
+
+/** Must match the server's maxImages. */
+const MAX_IMAGES = 50;
 
 const CAMERA_OPTIONS: ImagePicker.ImagePickerOptions = {
   mediaTypes: ["images"],
@@ -29,9 +34,12 @@ const CAMERA_OPTIONS: ImagePicker.ImagePickerOptions = {
 const LIBRARY_OPTIONS: ImagePicker.ImagePickerOptions = {
   ...CAMERA_OPTIONS,
   allowsMultipleSelection: true,
-  selectionLimit: 0, // 0 = no limit
+  selectionLimit: MAX_IMAGES,
   orderedSelection: true,
 };
+
+const DANGER = "#DC2626";
+const SUCCESS = "#16A34A";
 
 // Prefer the stable library id; camera captures only have a uri.
 const assetKey = (a: ImagePicker.ImagePickerAsset) => a.assetId ?? a.uri;
@@ -46,32 +54,49 @@ export function EquipmentUploadForm() {
   const [images, setImages] = useState<ImagePicker.ImagePickerAsset[]>([]);
   const [brand, setBrand] = useState("");
   const [model, setModel] = useState("");
-  const [submitting, setSubmitting] = useState(false);
+  const upload = useEquipmentUpload();
+  const network = useNetworkState();
 
+  const offline = network.isConnected === false;
+  const busy = upload.phase === "uploading";
+  const doneCount = upload.statuses.filter((s) => s === "done").length;
   const canSubmit =
-    images.length > 0 &&
-    brand.trim() !== "" &&
-    model.trim() !== "" &&
-    !submitting;
+    images.length > 0 && brand.trim() !== "" && model.trim() !== "" && !busy;
+  const canResume =
+    upload.phase === "error" &&
+    !(upload.error instanceof UploadError && upload.error.kind === "rejected");
+
+  // Editing the form after an attempt clears the per-photo status. Resume
+  // still works if the photos and fields end up unchanged.
+  function edit<T>(setter: (v: T) => void) {
+    return (v: T) => {
+      upload.dismiss();
+      setter(v);
+    };
+  }
 
   function addImages(assets: ImagePicker.ImagePickerAsset[]) {
+    upload.dismiss();
     setImages((prev) => {
       const seen = new Set(prev.map(assetKey));
-      return [...prev, ...assets.filter((a) => !seen.has(assetKey(a)))];
+      const next = [...prev, ...assets.filter((a) => !seen.has(assetKey(a)))];
+      if (next.length > MAX_IMAGES) {
+        notify("Too many photos", `You can upload at most ${MAX_IMAGES} photos.`);
+        return next.slice(0, MAX_IMAGES);
+      }
+      return next;
     });
   }
 
   function removeImage(key: string) {
+    upload.dismiss();
     setImages((prev) => prev.filter((a) => assetKey(a) !== key));
   }
 
   async function pickFromLibrary() {
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!perm.granted) {
-      notify(
-        "Permission needed",
-        "Allow photo library access to choose an image.",
-      );
+      notify("Permission needed", "Allow photo library access to choose images.");
       return;
     }
     const result = await ImagePicker.launchImageLibraryAsync(LIBRARY_OPTIONS);
@@ -95,37 +120,50 @@ export function EquipmentUploadForm() {
   }
 
   async function submit() {
-    if (images.length === 0) return;
-    setSubmitting(true);
-    try {
-      await uploadEquipment({
-        images,
-        brand: brand.trim(),
-        model: model.trim(),
-      });
-      notify(
-        "Uploaded",
-        `${brand.trim()} ${model.trim()} was uploaded with ${images.length} photo${images.length === 1 ? "" : "s"}.`,
-      );
-      setImages([]);
-      setBrand("");
-      setModel("");
-    } catch (e) {
-      const title =
-        e instanceof UploadNotConfiguredError
-          ? "Not configured"
-          : "Upload failed";
-      notify(title, e instanceof Error ? e.message : String(e));
-    } finally {
-      setSubmitting(false);
-    }
+    const b = brand.trim();
+    const m = model.trim();
+    const session = await upload.start(images, b, m);
+    if (!session) return; // error is shown inline
+    notify(
+      "Uploaded",
+      `${b} ${m} was uploaded with ${images.length} photo${images.length === 1 ? "" : "s"}.`,
+    );
+    upload.reset();
+    setImages([]);
+    setBrand("");
+    setModel("");
   }
+
+  let statusText: string | null = null;
+  if (busy) {
+    if (offline) statusText = "You're offline. Waiting for connection…";
+    else if (upload.retry) {
+      const what = upload.retry.index != null ? `photo ${upload.retry.index + 1}` : "request";
+      statusText = `Problem sending ${what}. Retrying in ${Math.ceil(upload.retry.delayMs / 1000)}s (attempt ${upload.retry.attempt + 1})…`;
+    } else if (upload.current != null) {
+      statusText = `Uploading photo ${upload.current + 1} of ${images.length}…`;
+    } else statusText = "Starting upload…";
+  }
+
+  const submitLabel = canResume
+    ? doneCount > 0
+      ? `Resume upload (${doneCount}/${images.length} sent)`
+      : "Try again"
+    : "Upload";
 
   return (
     <KeyboardAvoidingView
       style={styles.flex}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
+      {offline && (
+        <View style={styles.offlineBanner} accessibilityRole="alert">
+          <Ionicons name="cloud-offline-outline" size={18} color="#fff" />
+          <Text style={styles.offlineText}>
+            No connection. Uploads will continue when you&apos;re back online.
+          </Text>
+        </View>
+      )}
       <ScrollView
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
@@ -136,13 +174,18 @@ export function EquipmentUploadForm() {
               <Text style={styles.galleryTitle}>
                 {images.length} photo{images.length === 1 ? "" : "s"}
               </Text>
-              <Pressable
-                onPress={() => setImages([])}
-                accessibilityRole="button"
-                hitSlop={8}
-              >
-                <Text style={styles.clearText}>Clear all</Text>
-              </Pressable>
+              {!busy && (
+                <Pressable
+                  onPress={() => {
+                    upload.dismiss();
+                    setImages([]);
+                  }}
+                  accessibilityRole="button"
+                  hitSlop={8}
+                >
+                  <Text style={styles.clearText}>Clear all</Text>
+                </Pressable>
+              )}
             </View>
             <View style={styles.grid}>
               {images.map((img, i) => {
@@ -155,15 +198,18 @@ export function EquipmentUploadForm() {
                       resizeMode="cover"
                       accessibilityLabel={`Photo ${i + 1}`}
                     />
-                    <Pressable
-                      onPress={() => removeImage(key)}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Remove photo ${i + 1}`}
-                      hitSlop={8}
-                      style={styles.removeButton}
-                    >
-                      <Ionicons name="close" size={16} color="#fff" />
-                    </Pressable>
+                    <StatusOverlay status={upload.statuses[i]} />
+                    {!busy && (
+                      <Pressable
+                        onPress={() => removeImage(key)}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Remove photo ${i + 1}`}
+                        hitSlop={8}
+                        style={styles.removeButton}
+                      >
+                        <Ionicons name="close" size={16} color="#fff" />
+                      </Pressable>
+                    )}
                   </View>
                 );
               })}
@@ -172,11 +218,7 @@ export function EquipmentUploadForm() {
         ) : (
           <View style={styles.preview}>
             <View style={styles.previewEmpty}>
-              <Ionicons
-                name="images-outline"
-                size={48}
-                color={colors.textMuted}
-              />
+              <Ionicons name="images-outline" size={48} color={colors.textMuted} />
               <Text style={styles.muted}>No photos yet</Text>
             </View>
           </View>
@@ -187,11 +229,13 @@ export function EquipmentUploadForm() {
             icon="images-outline"
             label="Upload"
             onPress={pickFromLibrary}
+            disabled={busy}
           />
           <ImageButton
             icon="camera-outline"
             label="Camera"
             onPress={takePhoto}
+            disabled={busy}
           />
         </View>
 
@@ -199,7 +243,9 @@ export function EquipmentUploadForm() {
         <TextInput
           style={styles.input}
           value={brand}
-          onChangeText={setBrand}
+          onChangeText={edit(setBrand)}
+          editable={!busy}
+          maxLength={100}
           placeholder="e.g. Caterpillar"
           placeholderTextColor={colors.textMuted}
           autoCapitalize="words"
@@ -210,35 +256,87 @@ export function EquipmentUploadForm() {
         <TextInput
           style={styles.input}
           value={model}
-          onChangeText={setModel}
+          onChangeText={edit(setModel)}
+          editable={!busy}
+          maxLength={100}
           placeholder="e.g. 320 Excavator"
           placeholderTextColor={colors.textMuted}
           autoCapitalize="characters"
           returnKeyType="done"
         />
 
+        {upload.phase === "error" && (
+          <View style={styles.errorBox} accessibilityRole="alert">
+            <Ionicons name="alert-circle" size={20} color={DANGER} />
+            <Text style={styles.errorText}>
+              {describeUploadError(upload.error)}
+              {doneCount > 0 && canResume
+                ? ` ${doneCount} of ${images.length} photos are already on the server.`
+                : ""}
+            </Text>
+          </View>
+        )}
+
         <Pressable
           onPress={submit}
           disabled={!canSubmit}
           accessibilityRole="button"
-          accessibilityState={{ disabled: !canSubmit, busy: submitting }}
+          accessibilityState={{ disabled: !canSubmit, busy }}
           style={({ pressed }) => [
             styles.submit,
             !canSubmit && styles.submitDisabled,
             pressed && styles.pressed,
           ]}
         >
-          {submitting ? (
+          {busy ? (
             <ActivityIndicator color="#fff" />
           ) : (
             <>
-              <Ionicons name="cloud-upload-outline" size={20} color="#fff" />
-              <Text style={styles.submitText}>Upload</Text>
+              <Ionicons
+                name={canResume ? "refresh" : "cloud-upload-outline"}
+                size={20}
+                color="#fff"
+              />
+              <Text style={styles.submitText}>{submitLabel}</Text>
             </>
           )}
         </Pressable>
+
+        {busy && (
+          <>
+            <Text style={styles.statusText} accessibilityLiveRegion="polite">
+              {statusText}
+            </Text>
+            <Pressable
+              onPress={upload.cancel}
+              accessibilityRole="button"
+              style={({ pressed }) => [styles.cancel, pressed && styles.pressed]}
+            >
+              <Text style={styles.cancelText}>Cancel</Text>
+            </Pressable>
+          </>
+        )}
       </ScrollView>
     </KeyboardAvoidingView>
+  );
+}
+
+function StatusOverlay({ status }: { status?: ImageUploadStatus }) {
+  if (!status) return null;
+  return (
+    <View
+      style={[styles.overlay, status === "done" && styles.overlayClear]}
+      pointerEvents="none"
+    >
+      {status === "uploading" && <ActivityIndicator color="#fff" />}
+      {status === "pending" && <Ionicons name="time-outline" size={22} color="#fff" />}
+      {status === "failed" && <Ionicons name="alert-circle" size={26} color={DANGER} />}
+      {status === "done" && (
+        <View style={styles.doneBadge}>
+          <Ionicons name="checkmark" size={14} color="#fff" />
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -246,17 +344,24 @@ type ImageButtonProps = {
   icon: ComponentProps<typeof Ionicons>["name"];
   label: string;
   onPress: () => void;
+  disabled?: boolean;
 };
 
-function ImageButton({ icon, label, onPress }: ImageButtonProps) {
+function ImageButton({ icon, label, onPress, disabled }: ImageButtonProps) {
   return (
     <Pressable
       onPress={onPress}
+      disabled={disabled}
       accessibilityRole="button"
       accessibilityLabel={label}
-      style={({ pressed }) => [styles.imageButton, pressed && styles.pressed]}
+      accessibilityState={{ disabled }}
+      style={({ pressed }) => [
+        styles.imageButton,
+        disabled && styles.submitDisabled,
+        pressed && styles.pressed,
+      ]}
     >
-      <Ionicons name={icon} size={24} color={colors.primary} />
+      <Ionicons name={icon} size={28} color={colors.primary} />
       <Text style={styles.imageButtonText}>{label}</Text>
     </Pressable>
   );
@@ -265,6 +370,15 @@ function ImageButton({ icon, label, onPress }: ImageButtonProps) {
 const styles = StyleSheet.create({
   flex: { flex: 1 },
   content: { padding: spacing.md, gap: spacing.sm },
+  offlineBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    backgroundColor: colors.text,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  offlineText: { color: "#fff", flex: 1 },
   preview: {
     aspectRatio: 4 / 3,
     borderRadius: 12,
@@ -272,6 +386,12 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
+  },
+  previewEmpty: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
   },
   galleryHeader: {
     flexDirection: "row",
@@ -282,10 +402,31 @@ const styles = StyleSheet.create({
   clearText: { color: colors.primary, fontWeight: "600" },
   grid: { flexDirection: "row", flexWrap: "wrap", marginHorizontal: -4 },
   cell: { width: "33.333%", aspectRatio: 1, padding: 4 },
-  thumb: {
-    flex: 1,
+  thumb: { flex: 1, borderRadius: 10, backgroundColor: colors.border },
+  overlay: {
+    position: "absolute",
+    top: 4,
+    left: 4,
+    right: 4,
+    bottom: 4,
     borderRadius: 10,
-    backgroundColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(15, 23, 42, 0.45)",
+  },
+  overlayClear: {
+    backgroundColor: "transparent",
+    alignItems: "flex-start",
+    justifyContent: "flex-end",
+    padding: 6,
+  },
+  doneBadge: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: SUCCESS,
+    alignItems: "center",
+    justifyContent: "center",
   },
   removeButton: {
     position: "absolute",
@@ -297,12 +438,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "rgba(15, 23, 42, 0.7)",
-  },
-  previewEmpty: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    gap: spacing.sm,
   },
   muted: { color: colors.textMuted },
   row: { flexDirection: "row", gap: spacing.md, marginVertical: spacing.sm },
@@ -328,6 +463,17 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: colors.text,
   },
+  errorBox: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginTop: spacing.md,
+    padding: spacing.md,
+    borderRadius: 10,
+    backgroundColor: "#FEF2F2",
+    borderWidth: 1,
+    borderColor: "#FECACA",
+  },
+  errorText: { flex: 1, color: "#991B1B" },
   submit: {
     marginTop: spacing.lg,
     flexDirection: "row",
@@ -341,5 +487,8 @@ const styles = StyleSheet.create({
   },
   submitDisabled: { opacity: 0.4 },
   submitText: { color: "#fff", fontSize: 16, fontWeight: "700" },
+  statusText: { textAlign: "center", color: colors.textMuted },
+  cancel: { alignSelf: "center", padding: spacing.sm },
+  cancelText: { color: DANGER, fontWeight: "600" },
   pressed: { opacity: 0.7 },
 });

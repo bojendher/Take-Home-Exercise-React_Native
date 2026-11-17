@@ -9,6 +9,7 @@
     "expo-font": "~58.0.12",
     "expo-image-picker": "~58.0.10",
     "expo-linking": "~58.0.17",
+    "expo-network": "~58.0.5",
     "expo-router": "~58.0.32",
     "expo-status-bar": "~58.0.5",
     "react": "19.3.0",
@@ -30,7 +31,10 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "server": "node server/index.mjs",
+    "server:flaky": "SIM_PRESET=flaky node server/index.mjs",
+    "test:server": "node --test server/app.test.mjs"
   },
   "private": true
 }
